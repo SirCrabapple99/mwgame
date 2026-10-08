@@ -76,6 +76,7 @@
 
   function workerSource() {
     return `
+      console.log('[streamfs-worker] started');
       let ctrl, data;
       const handles = new Map();   // id -> FileSystemFileHandle
       const files = new Map();     // id -> File (cached getFile() result)
@@ -219,6 +220,7 @@
     const seq = S.lastMiss && S.lastMiss.key === cacheKey.slice(0, cacheKey.lastIndexOf(':')) && S.lastMiss.end === start;
     S.lastMiss = { key: cacheKey.slice(0, cacheKey.lastIndexOf(':')), end };
     const next = seq && src.url && end - start === CHUNK && end < size ? { start: end, end: Math.min(end + CHUNK, size) } : null;
+    if (ST.misses < 5) console.log('[streamfs] miss -> worker', cacheKey, 'gen', gen);
     S.worker.postMessage(Object.assign({ start, end, gen, next }, src));
     // Spin until the worker signals completion. The worker thread runs independently, so
     // this terminates; local reads complete in ~1-5ms. (Atomics.wait is disallowed on
@@ -233,6 +235,7 @@
       if (performance.now() - t0 > 120000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start);
     }
     ST.misses++; ST.stallMs += performance.now() - t0;
+    if (ST.misses <= 5) console.log('[streamfs] worker answered', Math.round(performance.now() - t0) + 'ms', 'n=' + S.ctrl[1]);
     const n = S.ctrl[1];
     if (n < 0) throw new Error('streamfs: read failed ' + cacheKey + '@' + start);
     const chunk = new Uint8Array(n);
