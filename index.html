@@ -702,7 +702,24 @@
                     "fallback=Movies_New_Game,mw_intro.bik",
                   );
                 FS.writeFile("/openmw.cfg", cfg.join("\n"));
-                removeRunDependency("mw-data");
+                var t0 = performance.now();
+                Promise.race([
+                  StreamFS.whenReady(),
+                  new Promise(function (r) {
+                    setTimeout(function () {
+                      r("timeout");
+                    }, 10000);
+                  }),
+                ]).then(function (v) {
+                  log(
+                    v === "timeout"
+                      ? "[streamfs] worker did not start in 10s"
+                      : "[streamfs] worker ready in " +
+                          Math.round(performance.now() - t0) +
+                          "ms",
+                  );
+                  removeRunDependency("mw-data");
+                });
               })();
             })
             .catch(function (e) {

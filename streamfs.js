@@ -198,7 +198,9 @@
           Atomics.store(ctrl, 0, m.gen);
           Atomics.notify(ctrl, 0);
         }
-      };`;
+      };
+      postMessage({ ready: 1 });
+    `;
   }
 
   let generation = 0;
@@ -286,6 +288,7 @@
   }
 
   window.StreamFS = {
+    whenReady() { return S.ready || Promise.resolve(); },
     // Live streaming cost: misses each blocked the main thread for a worker round-trip.
     // High misses + high evictions = the working set exceeds LRU_MAX and is thrashing.
     stats() { return Object.assign({ cached: S.cache.size, lruMax: LRU_MAX }, ST); },
@@ -301,6 +304,12 @@
       S.ctrl = new Int32Array(ctrlBuf);
       S.data = new Uint8Array(dataBuf);
       S.worker = new Worker(URL.createObjectURL(new Blob([workerSource()], { type: 'text/javascript' })));
+      // Resolves once the worker has actually started. Reads block the main thread, so the engine
+      // must not begin until the worker is up (it can't start while the main thread never yields).
+      S.ready = new Promise((res) => {
+        S.worker.onmessage = (e) => { if (e.data && e.data.ready) res(); };
+        S.worker.onerror = (e) => { console.error('[streamfs] worker error', e.message || e); };
+      });
       S.worker.postMessage({ init: 1, ctrl: ctrlBuf, data: dataBuf });
       try { Object.defineProperty(window, '__streamfsStats', { get: () => window.StreamFS.stats() }); } catch (e) {}
     },
