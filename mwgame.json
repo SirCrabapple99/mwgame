@@ -1,0 +1,14 @@
+{
+  "games": [
+    {
+      "title": "Morrowind",
+      "cover": "cover.png",
+      "html": "index.html",
+      "path": "./",
+      "_SN_INFO": null
+    }
+  ],
+  "_SN_INFO": {
+    "baseUrl": "https://cdn.jsdelivr.net/gh/SirCrabapple99/mwgame@latest/"
+  }
+}
