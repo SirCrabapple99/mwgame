@@ -717,12 +717,31 @@
     <script>
       if (!window.__omwFailed)
         (function () {
-          var s = document.createElement("script");
-          s.src = window.__omwEngineSrc;
-          s.onerror = function () {
-            window.__omwFatal("could not load " + s.src);
-          };
-          document.body.appendChild(s);
+          // Workers can't be constructed from a cross-origin script URL (e.g. when this page is
+          // hosted on a CDN and embedded elsewhere), so hand emscripten a same-origin blob for its
+          // pthread workers.
+          function boot() {
+            var s = document.createElement("script");
+            s.src = window.__omwEngineSrc;
+            s.onerror = function () {
+              window.__omwFatal("could not load " + s.src);
+            };
+            document.body.appendChild(s);
+          }
+          fetch(window.__omwEngineSrc)
+            .then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.blob();
+            })
+            .then(function (b) {
+              window.Module.mainScriptUrlOrBlob = new Blob([b], {
+                type: "text/javascript",
+              });
+            })
+            .catch(function (e) {
+              console.warn("engine blob fetch failed", e);
+            })
+            .then(boot);
         })();
     </script>
   
