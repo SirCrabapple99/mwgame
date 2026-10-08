@@ -67,7 +67,12 @@
 
   // cache is a Map used as an LRU: insertion order IS the recency order (delete+set moves to end),
   // so eviction pops the first (oldest) key. No separate order array → O(1) hit path, no linear scan.
-  const S = { worker: null, ctrl: null, data: null, cache: new Map(), nextId: 1, urlSrcs: new Map() };
+  const S = { worker: null, ctrl: null, data: null, cache: new Map(), nextId: 1, nextSid: 1, syncN: 0, syncRes: new Map(), urlSrcs: new Map() };
+  // Tell the worker how to reach a source; requests then refer to it by `sid` through shared memory.
+  function registerSrc(src) {
+    if (!src.sid) src.sid = S.nextSid++;
+    S.worker.postMessage({ regSrc: { sid: src.sid, url: src.url, pkey: src.pkey, id: src.id } });
+  }
 
   // Streaming cost counters, exposed as window.__streamfsStats. Chunk misses block the main thread
   // (see fetchChunkSync), so this is the only place the stall is observable. Two adds per read —
@@ -161,13 +166,39 @@
       }
       onmessage = async (e) => {
         const m = e.data;
-        if (m.gen && ctrl) Atomics.store(ctrl, 4, m.gen);
-        if (m.init) { ctrl = new Int32Array(m.ctrl); data = new Uint8Array(m.data); return; }
+        if (m.init) { ctrl = new Int32Array(m.ctrl); data = new Uint8Array(m.data); startPump(); return; }
         if (m.mountLocal) { handles.set(m.mountLocal.id, m.mountLocal.handle); return; }
         // A Blob (BSA from the Cache API) reads exactly like a File (slice + arrayBuffer), so it
         // goes straight into the files map and the m.id read path below slices it locally.
         if (m.mountBlob) { files.set(m.mountBlob.id, m.mountBlob.blob); return; }
-        // m: {url|id, start, end, gen}
+        if (m.regSrc) { srcs.set(m.regSrc.sid, m.regSrc); return; }
+        if (m.sync) { postMessage({ synced: m.sync }); return; }
+      };
+      // Requests arrive through SHARED MEMORY, not postMessage: the engine's read blocks the main
+      // thread, and Chrome does not reliably deliver main->worker messages while it is blocked (the
+      // worker saw the request only after the 25s timeout). ctrl: [5]=request gen (written last),
+      // [6]=source id, [7]=start, [8]=end, [9]/[10]=prefetch next start/end ([9]<0: none).
+      const srcs = new Map();      // source id -> {url, pkey} | {id}
+      let pumping = false;
+      async function startPump() {
+        if (pumping) return; pumping = true;
+        let seen = 0;
+        for (;;) {
+          if (Atomics.waitAsync) { const r = Atomics.waitAsync(ctrl, 5, seen); if (r.async) await r.value; }
+          else await new Promise((res) => setTimeout(res, 1));
+          const g = Atomics.load(ctrl, 5);
+          if (g === seen) continue;
+          seen = g;
+          Atomics.store(ctrl, 4, g);
+          const src = srcs.get(Atomics.load(ctrl, 6));
+          if (!src) { stage(7, Atomics.load(ctrl, 6)); ctrl[1] = -1; Atomics.store(ctrl, 0, g); Atomics.notify(ctrl, 0); continue; }
+          const ns = Atomics.load(ctrl, 9);
+          serve({ url: src.url, pkey: src.pkey, id: src.id, start: Atomics.load(ctrl, 7), end: Atomics.load(ctrl, 8),
+                  gen: g, next: ns >= 0 ? { start: ns, end: Atomics.load(ctrl, 10) } : null });
+        }
+      }
+      // m: {url|id, start, end, gen}
+      async function serve(m) {
         try {
           let buf;
           if (m.id !== undefined) {
@@ -228,7 +259,7 @@
           Atomics.store(ctrl, 0, m.gen);
           Atomics.notify(ctrl, 0);
         }
-      };
+      }
       postMessage({ ready: 1 });
     `;
   }
@@ -250,7 +281,13 @@
     S.lastMiss = { key: cacheKey.slice(0, cacheKey.lastIndexOf(':')), end };
     const next = seq && src.url && end - start === CHUNK && end < size ? { start: end, end: Math.min(end + CHUNK, size) } : null;
     if (ST.misses < 5) console.log('[streamfs] miss -> worker', cacheKey, 'gen', gen);
-    S.worker.postMessage(Object.assign({ start, end, gen, next }, src));
+    Atomics.store(S.ctrl, 6, src.sid);
+    Atomics.store(S.ctrl, 7, start);
+    Atomics.store(S.ctrl, 8, end);
+    Atomics.store(S.ctrl, 9, next ? next.start : -1);
+    Atomics.store(S.ctrl, 10, next ? next.end : 0);
+    Atomics.store(S.ctrl, 5, gen);       // request gen is written last
+    Atomics.notify(S.ctrl, 5);
     // Spin until the worker signals completion. The worker thread runs independently, so
     // this terminates; local reads complete in ~1-5ms. (Atomics.wait is disallowed on
     // the main thread, so poll.)
@@ -261,7 +298,7 @@
     // eviction-thrashing working set shows up as misses climbing without bytes growing.
     const t0 = performance.now();
     while (Atomics.load(S.ctrl, 0) !== gen) {
-      if (performance.now() - t0 > 25000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start + ' [worker stage=' + Atomics.load(S.ctrl, 2) + ' detail=' + Atomics.load(S.ctrl, 3) + ' lastGenSeen=' + Atomics.load(S.ctrl, 4) + ' wantGen=' + gen + ']');
+      if (performance.now() - t0 > 60000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start + ' [worker stage=' + Atomics.load(S.ctrl, 2) + ' detail=' + Atomics.load(S.ctrl, 3) + ' lastGenSeen=' + Atomics.load(S.ctrl, 4) + ' wantGen=' + gen + ']');
     }
     ST.misses++; ST.stallMs += performance.now() - t0;
     if (ST.misses <= 5) console.log('[streamfs] worker answered', Math.round(performance.now() - t0) + 'ms', 'n=' + S.ctrl[1]);
@@ -320,7 +357,14 @@
   }
 
   window.StreamFS = {
-    whenReady() { return S.ready || Promise.resolve(); },
+    // Resolves once the worker is running AND has processed every earlier message (all mounts), so no
+    // request can reach it before its source is registered.
+    whenReady() {
+      return (S.ready || Promise.resolve()).then(() => new Promise((res) => {
+        if (!S.worker) return res();
+        const t = ++S.syncN; S.syncRes.set(t, res); S.worker.postMessage({ sync: t });
+      }));
+    },
     // Live streaming cost: misses each blocked the main thread for a worker round-trip.
     // High misses + high evictions = the working set exceeds LRU_MAX and is thrashing.
     stats() { return Object.assign({ cached: S.cache.size, lruMax: LRU_MAX }, ST); },
@@ -331,7 +375,7 @@
       // also the JS-side memory ceiling: 384MB high / 192MB mid / 96MB low, on top of the wasm heap.
       if (!LRU_MAX) LRU_MAX = (typeof window !== 'undefined' && window.__omwLruDefault | 0) || 128;
       if (!self.crossOriginIsolated) throw new Error('streamfs needs crossOriginIsolated (COOP/COEP)');
-      const ctrlBuf = new SharedArrayBuffer(32);
+      const ctrlBuf = new SharedArrayBuffer(64);
       const dataBuf = new SharedArrayBuffer(CHUNK);
       S.ctrl = new Int32Array(ctrlBuf);
       S.data = new Uint8Array(dataBuf);
@@ -339,7 +383,11 @@
       // Resolves once the worker has actually started. Reads block the main thread, so the engine
       // must not begin until the worker is up (it can't start while the main thread never yields).
       S.ready = new Promise((res) => {
-        S.worker.onmessage = (e) => { if (e.data && e.data.ready) res(); };
+        S.worker.onmessage = (e) => {
+          const d = e.data || {};
+          if (d.ready) res();
+          else if (d.synced) { const f = S.syncRes.get(d.synced); if (f) { S.syncRes.delete(d.synced); f(); } }
+        };
         S.worker.onerror = (e) => { console.error('[streamfs] worker error', e.message || e); };
       });
       S.worker.postMessage({ init: 1, ctrl: ctrlBuf, data: dataBuf });
@@ -361,6 +409,7 @@
       const pkey = u.origin === location.origin && !u.search
         ? u.pathname + '@' + size + (mtime ? '@' + mtime : '') + '@' + CHUNK : null;
       const src = { url: abs, pkey };
+      registerSrc(src);
       // Registered so the URL can be refreshed later (presigned locker URLs expire): the cache
       // key stays `abs` (stable across renewals — the bytes are the same file), only src.url
       // changes, so a re-signed URL is used for future Range fetches without dropping the cache.
@@ -375,7 +424,7 @@
     // locker URL on a timer, before expiry, by calling this.
     setUrl(path, url) {
       const src = S.urlSrcs.get(path);
-      if (src) src.url = new URL(url, document.baseURI).href;
+      if (src) { src.url = new URL(url, document.baseURI).href; registerSrc(src); }
     },
 
     // Mount a local `FileSystemFileHandle` at FS path `path` with known byte size. The handle
@@ -385,6 +434,7 @@
       const id = S.nextId++;
       S.worker.postMessage({ mountLocal: { id, handle } });
       const src = { id };
+      registerSrc(src);
       return makeNode(path, size, function (buffer, offset, length, position) {
         return readSync(src, 'id' + id, size, buffer, offset, length, position);
       });
@@ -397,6 +447,7 @@
       const id = S.nextId++;
       S.worker.postMessage({ mountBlob: { id, blob } });
       const src = { id };
+      registerSrc(src);
       return makeNode(path, size, function (buffer, offset, length, position) {
         return readSync(src, 'id' + id, size, buffer, offset, length, position);
       });
