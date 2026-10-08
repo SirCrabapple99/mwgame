@@ -100,7 +100,7 @@
       const lastPart = new Map();  // url -> last part index read
       // Whole parts are kept in a small in-memory LRU and persisted in the Cache API, keyed without
       // the jsDelivr commit hash (retail data never changes), so a revisit or a new deploy re-uses them.
-      const partKey = (pk) => 'https://sfs.part/' + encodeURIComponent(pk.replace(/@[0-9a-f]{7,40}(?![0-9a-f])/, '@'));
+      const partKey = (pk) => 'https://sfs.part/' + encodeURIComponent(pk.replace(/@(?:[0-9a-f]{7,40}(?![0-9a-f])|latest|main)(?=\/)/, '@'));
       function getPart(url, idx) {
         const pk = idx < 0 ? url : url + '.part' + String(idx).padStart(3, '0');   // idx<0: the unsplit file itself
         let whole = partCache.get(pk);
