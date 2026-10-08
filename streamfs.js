@@ -86,8 +86,11 @@
       const split = new Map();     // url -> true when only the .partNNN pieces exist
       const partCache = new Map(); // part url -> Promise<Uint8Array> (whole part, small LRU)
       async function rangeFetch(url, start, end) {
+        const T0 = performance.now();
+        console.log('[streamfs-worker] read', url, start, end, 'split=' + !!split.get(url));
         if (!split.get(url)) {
           const r = await fetch(url, { headers: { Range: 'bytes=' + start + '-' + (end - 1) } });
+          console.log('[streamfs-worker] plain fetch ->', r.status, Math.round(performance.now() - T0) + 'ms');
           if (r.ok || r.status === 206) return new Uint8Array(await r.arrayBuffer());
           if (r.status !== 404) throw new Error('HTTP ' + r.status);
           split.set(url, true);
@@ -103,9 +106,12 @@
           const pk = url + '.part' + String(idx).padStart(3, '0');
           let whole = partCache.get(pk);
           if (!whole) {
+            console.log('[streamfs-worker] downloading', pk);
             whole = fetch(pk).then(async (r) => {
               if (!r.ok) throw new Error('HTTP ' + r.status);
-              return new Uint8Array(await r.arrayBuffer());
+              const u = new Uint8Array(await r.arrayBuffer());
+              console.log('[streamfs-worker] got', pk, u.length, Math.round(performance.now() - T0) + 'ms');
+              return u;
             });
             partCache.set(pk, whole);
             whole.catch(() => partCache.delete(pk));
@@ -180,6 +186,7 @@
             })() };
           }
         } catch (err) {
+          console.error('[streamfs-worker] read failed', m.url, m.start, err && err.message || err);
           ctrl[1] = -1;
           Atomics.store(ctrl, 0, m.gen);
           Atomics.notify(ctrl, 0);
@@ -214,7 +221,7 @@
     // eviction-thrashing working set shows up as misses climbing without bytes growing.
     const t0 = performance.now();
     while (Atomics.load(S.ctrl, 0) !== gen) {
-      if (performance.now() - t0 > 30000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start);
+      if (performance.now() - t0 > 120000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start);
     }
     ST.misses++; ST.stallMs += performance.now() - t0;
     const n = S.ctrl[1];
