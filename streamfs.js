@@ -84,6 +84,7 @@
       // each (the last shorter). If the plain URL 404s, read the range from the parts instead.
       const PART = 15728640;
       const split = new Map();     // url -> true when only the .partNNN pieces exist
+      const partCache = new Map(); // part url -> Promise<Uint8Array> (whole part, small LRU)
       async function rangeFetch(url, start, end) {
         if (!split.get(url)) {
           const r = await fetch(url, { headers: { Range: 'bytes=' + start + '-' + (end - 1) } });
@@ -96,12 +97,21 @@
         for (let pos = start; pos < end;) {
           const idx = Math.floor(pos / PART), base = idx * PART;
           const to = Math.min(end, base + PART);
-          const r = await fetch(url + '.part' + String(idx).padStart(3, '0'),
-            { headers: { Range: 'bytes=' + (pos - base) + '-' + (to - base - 1) } });
-          if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status);
-          let b = new Uint8Array(await r.arrayBuffer());
-          // A server that ignores Range sends the whole part: cut out the slice we asked for.
-          if (r.status === 200 && b.length > to - pos) b = b.subarray(pos - base, to - base);
+          // Whole-part GET + local slice, not a Range request: some CDNs (jsDelivr) return a wrong
+          // Content-Range and a truncated/garbled body for Range on these files. Parts are cached
+          // (small LRU) so the many 2MB chunk reads inside one 15MB part cost a single download.
+          const pk = url + '.part' + String(idx).padStart(3, '0');
+          let whole = partCache.get(pk);
+          if (!whole) {
+            whole = fetch(pk).then(async (r) => {
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              return new Uint8Array(await r.arrayBuffer());
+            });
+            partCache.set(pk, whole);
+            whole.catch(() => partCache.delete(pk));
+            while (partCache.size > 4) partCache.delete(partCache.keys().next().value);
+          } else { partCache.delete(pk); partCache.set(pk, whole); }
+          const b = (await whole).subarray(pos - base, to - base);
           out.set(b, off);
           off += b.length;
           pos = to;
