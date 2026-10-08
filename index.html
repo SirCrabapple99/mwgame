@@ -98,3 +98,838 @@
         setInterval(function () {
           if (failed) return;
           if (window.Module && Module.__omwRunning !== undefined) {
+            ld.classList.add("off");
+            return;
+          }
+          mbEl.textContent = Math.round(loadedBytes() / 1048576) + " MB";
+        }, 250);
+        function log(t) {
+          try {
+            console.log(t);
+          } catch (e) {}
+        }
+
+        // ---- requirements ------------------------------------------------------------------------
+        // A static host that sends no COOP/COEP headers gets them from coi-sw.js: register it, then
+        // reload once so the page itself is served through it.
+        var needIsolation = self.isSecureContext && !self.crossOriginIsolated;
+        if (
+          needIsolation &&
+          "serviceWorker" in navigator &&
+          !sessionStorage.getItem("omw_coi")
+        ) {
+          sessionStorage.setItem("omw_coi", "1");
+          window.__omwFailed = true; // hold the engine back; the reload boots it
+          navigator.serviceWorker.register("coi-sw.js").then(
+            function (reg) {
+              var sw = reg.installing || reg.waiting || reg.active;
+              if (sw && sw.state !== "activated")
+                sw.addEventListener("statechange", function () {
+                  if (sw.state === "activated") location.reload();
+                });
+              else location.reload();
+            },
+            function (e) {
+              fatal("service worker failed: " + e);
+            },
+          );
+        } else if (!self.isSecureContext) fatal("needs https or localhost");
+        else if (
+          !self.crossOriginIsolated ||
+          typeof SharedArrayBuffer === "undefined"
+        )
+          fatal("needs COOP/COEP headers");
+        else if (
+          !(function () {
+            try {
+              new WebAssembly.Memory({
+                initial: 1n,
+                maximum: 262144n,
+                shared: true,
+                address: "i64",
+              });
+              return true;
+            } catch (e) {
+              return false;
+            }
+          })()
+        )
+          fatal("browser lacks WebAssembly Memory64");
+
+        // ---- WebGL context: opaque canvas, discrete GPU, extensions the renderer needs -----------
+        var origGetContext = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function (type, attrs) {
+          var gl =
+            type === "webgl2" ||
+            type === "webgl" ||
+            type === "experimental-webgl";
+          if (gl) {
+            attrs = attrs || {};
+            attrs.alpha = false;
+            attrs.premultipliedAlpha = false;
+            if (
+              attrs.powerPreference == null ||
+              attrs.powerPreference === "default"
+            )
+              attrs.powerPreference = "high-performance";
+          }
+          var ctx = origGetContext.call(this, type, attrs);
+          if (ctx && gl)
+            [
+              "EXT_texture_filter_anisotropic",
+              "EXT_color_buffer_float",
+              "EXT_color_buffer_half_float",
+              "OES_texture_float_linear",
+              "WEBGL_compressed_texture_s3tc",
+              "WEBGL_compressed_texture_s3tc_srgb",
+            ].forEach(function (x) {
+              try {
+                ctx.getExtension(x);
+              } catch (e) {}
+            });
+          return ctx;
+        };
+        canvas.addEventListener("webglcontextlost", function (e) {
+          e.preventDefault();
+          try {
+            if (window.__omwSync) window.__omwSync();
+          } catch (_) {}
+          location.reload();
+        });
+
+        // ---- low-end mode ------------------------------------------------------------------------
+        // "potato" turns everything optional off (no shadows, simple water, no distant terrain, small
+        // render target) for weak GPUs/CPUs such as a Celeron Chromebook. It is picked automatically
+        // on <=4 cores or <=4GB RAM, and can be forced either way from the console:
+        //   localStorage.omw_quality = "potato" | "low" | "mid" | "high"   (remove it for auto)
+        var devMem = navigator.deviceMemory || 0;
+        var cores = navigator.hardwareConcurrency || 0;
+        var qOverride = "";
+        try {
+          qOverride = localStorage.getItem("omw_quality") || "";
+        } catch (e) {}
+        var isPotato =
+          qOverride === "potato" ||
+          (!/^(low|mid|high)$/.test(qOverride) &&
+            ((cores > 0 && cores <= 4) || (devMem > 0 && devMem <= 4)));
+
+        // ---- render size: drawing buffer at device pixels under a pixel budget -------------------
+        var ss = 1;
+        try {
+          ss = parseFloat(localStorage.getItem("omw_ss")) || 1;
+        } catch (e) {}
+        ss = Math.max(1, Math.min(2, ss));
+        if (isPotato) ss = 1;
+        function renderSize(factor) {
+          var dpr = window.devicePixelRatio || 1;
+          var cssW = window.innerWidth || 1280,
+            cssH = window.innerHeight || 720;
+          var w = cssW * dpr,
+            h = cssH * dpr;
+          var base = Math.min(1, Math.sqrt((isPotato ? 800000 : 4000000) / (w * h)));
+          var scale = base * factor;
+          var cap = isPotato ? 800000 : 5500000;
+          if (w * h * scale * scale > cap) scale = Math.sqrt(cap / (w * h));
+          return {
+            base: base,
+            eff: scale / base,
+            w: Math.max(320, Math.round(w * scale)),
+            h: Math.max(240, Math.round(h * scale)),
+            cssW: cssW,
+          };
+        }
+        function applySize(s) {
+          window.__ssaaCurrent = s.eff;
+          window.__renderW = s.w;
+          window.__renderH = s.h;
+          window.__guiScale = s.w / s.cssW;
+        }
+        var first = renderSize(ss);
+        applySize(first);
+        canvas.width = first.w;
+        canvas.height = first.h;
+        canvas.addEventListener("pointerdown", function () {
+          canvas.focus();
+        });
+        window.addEventListener("load", function () {
+          canvas.focus();
+        });
+
+        var resizeTimer = null;
+        function resizeEngine(factor) {
+          if (!(window.Module && Module._omw_set_resolution)) return;
+          var s = renderSize(factor);
+          applySize(s);
+          if (s.w === canvas.width && s.h === canvas.height) return;
+          try {
+            Module._omw_set_resolution(s.w, s.h);
+          } catch (e) {
+            log("[resize] " + e);
+          }
+        }
+        window.addEventListener("resize", function () {
+          clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(function () {
+            resizeEngine(window.__ssaaCurrent || ss);
+          }, 300);
+        });
+        // Called by the engine when the Options antialiasing setting changes.
+        window.__omwSetSSAA = function (factor) {
+          factor = isPotato ? 1 : Math.max(1, Math.min(2, +factor || 1));
+          try {
+            localStorage.setItem("omw_ss", String(factor));
+          } catch (e) {}
+          resizeEngine(factor);
+        };
+
+        // ---- input guards ------------------------------------------------------------------------
+        window.addEventListener(
+          "keydown",
+          function (e) {
+            var mod = e.ctrlKey || e.metaKey;
+            if (
+              e.key === "Tab" ||
+              (mod && (e.key === "s" || e.key === "S")) ||
+              e.key === "F5" ||
+              (mod && (e.key === "r" || e.key === "R"))
+            ) {
+              e.preventDefault();
+              return;
+            }
+            if (
+              document.activeElement !== canvas &&
+              !e.metaKey &&
+              !e.ctrlKey &&
+              !e.altKey
+            )
+              canvas.focus();
+          },
+          { capture: true },
+        );
+        document.addEventListener("paste", function (e) {
+          try {
+            var t = e.clipboardData && e.clipboardData.getData("text/plain");
+            if (t && window.Module && Module.ccall)
+              Module.ccall("omw_set_clipboard", null, ["string"], [t]);
+          } catch (ex) {}
+        });
+        // Pointer lock is refused if requested without a gesture; retry on the next click.
+        canvas.addEventListener("pointerdown", function () {
+          try {
+            if (
+              window.Module &&
+              Module.__omwWantsMouseLock &&
+              document.pointerLockElement !== canvas
+            ) {
+              var p = canvas.requestPointerLock();
+              if (p && typeof p.catch === "function") p.catch(function () {});
+            }
+          } catch (e) {}
+        });
+        // SDL's own requestPointerLock() promise has no .catch; the rejection is expected and harmless.
+        window.addEventListener("unhandledrejection", function (e) {
+          var msg = String((e.reason && e.reason.message) || e.reason);
+          if (msg.indexOf("Pointer lock") !== -1) {
+            e.preventDefault();
+            return;
+          }
+          log("unhandled rejection: " + msg);
+          if (/openmw\.data/.test(msg)) fatal("failed to download openmw.data");
+        });
+        window.addEventListener("error", function (e) {
+          log("window error: " + e.message);
+        });
+
+        // ---- page <-> engine hooks ---------------------------------------------------------------
+        // Saves/settings live on IDBFS; two syncfs in flight at once race and drop writes, so coalesce.
+        var syncing = false,
+          syncAgain = false;
+        window.__omwSyncfs = function () {
+          try {
+            if (typeof FS === "undefined" || !FS.syncfs) return;
+            if (syncing) {
+              syncAgain = true;
+              return;
+            }
+            syncing = true;
+            FS.syncfs(false, function (err) {
+              if (err) log("[syncfs] " + err);
+              syncing = false;
+              if (syncAgain) {
+                syncAgain = false;
+                window.__omwSyncfs();
+              }
+            });
+          } catch (e) {}
+        };
+        window.__omwSync = function () {
+          try {
+            if (Module._omw_save_settings && Module.__omwRunning !== undefined)
+              Module._omw_save_settings();
+          } catch (e) {}
+          window.__omwSyncfs();
+        };
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState === "hidden") window.__omwSync();
+        });
+        window.addEventListener("pagehide", window.__omwSync);
+        window.__omwOnQuit = function () {
+          location.reload();
+        };
+        window.__omwExitToLauncher = function () {
+          location.reload();
+        };
+        window.__omwSkipIntroFlag = false;
+
+        // The build stamps __ENGINE_VERSION__ with a hash and moves openmw.{js,wasm,data} to e/<hash>/.
+        // Unstamped (a raw checkout) falls back to flat paths.
+        var ENGINE_VER = "__ENGINE_VERSION__";
+        var ENGINE_DIR =
+          ENGINE_VER.charAt(0) === "_" ? "" : "e/" + ENGINE_VER + "/";
+
+        // ---- Data Files --------------------------------------------------------------------------
+        // "Data Files" sits next to this page, with manifest.json (make-manifest.py) listing it. Every
+        // file is mounted as a lazy StreamFS node (HTTP Range reads), so nothing is resident up front.
+        function buildLoadOrder(rootFiles) {
+          var masters = ["morrowind.esm", "tribunal.esm", "bloodmoon.esm"];
+          var archives = ["morrowind.bsa", "tribunal.bsa", "bloodmoon.bsa"];
+          var content = [],
+            fbarch = [];
+          // Naming a file the VFS lacks is a hard startup failure, so only list what is present.
+          masters.forEach(function (m) {
+            if (rootFiles.has(m)) content.push(rootFiles.get(m));
+          });
+          archives.forEach(function (a) {
+            if (rootFiles.has(a)) fbarch.push(rootFiles.get(a));
+          });
+          var official = new Set(masters.concat(archives)),
+            esm = [],
+            esp = [],
+            bsa = [];
+          rootFiles.forEach(function (orig, lower) {
+            if (official.has(lower)) return;
+            if (/\.esm$/.test(lower)) esm.push(orig);
+            else if (/\.esp$/.test(lower)) esp.push(orig);
+            else if (/\.bsa$/.test(lower)) bsa.push(orig);
+          });
+          var byName = function (a, b) {
+            return a.toLowerCase() < b.toLowerCase() ? -1 : 1;
+          };
+          esm.sort(byName);
+          esp.sort(byName);
+          bsa.sort(byName);
+          return {
+            content: content.concat(esm, esp),
+            fbarch: fbarch.concat(bsa),
+          };
+        }
+
+        // ---- quality tier, from device memory (coarse; absent on Firefox/Safari -> middle tier) ----
+        var tier = /^(low|mid|high)$/.test(qOverride)
+          ? qOverride
+          : devMem >= 8
+            ? "high"
+            : devMem > 0 && devMem <= 4
+              ? "low"
+              : "mid";
+        var TIER = {
+          low: {
+            vd: "8192",
+            minSize: "0.02",
+            shadowRes: "2048",
+            shadowDist: "512",
+            rtt: "512",
+            actors: "3072",
+            lru: 48,
+          },
+          mid: {
+            vd: "12288",
+            minSize: "0.01",
+            shadowRes: "4096",
+            shadowDist: "768",
+            rtt: "1024",
+            actors: "4096",
+            lru: 96,
+          },
+          high: {
+            vd: "16384",
+            minSize: "0.005",
+            shadowRes: "8192",
+            shadowDist: "1024",
+            rtt: "1024",
+            actors: "4096",
+            lru: 192,
+          },
+        }[tier];
+        window.__omwLruDefault = isPotato ? 64 : TIER.lru; // read lazily by streamfs.js
+
+        // Everything the engine would spend GPU/CPU on and a weak machine can live without. Applied as
+        // the baseline AND forced over the saved user settings (see forceUserSettings), so the in-game
+        // options (or older saved values) can't turn shadows etc. back on.
+        var POTATO = {
+          Camera: {
+            "viewing distance": "5120.0",
+            "small feature culling": "true",
+            "small feature culling pixel size": "16.0",
+          },
+          Terrain: {
+            "distant terrain": "false",
+            "object paging": "false",
+            "object paging active grid": "false",
+          },
+          Water: {
+            shader: "false",
+            refraction: "false",
+            "reflection detail": "0",
+            "rain ripple detail": "0",
+            "rtt size": "256",
+          },
+          Fog: {
+            "radial fog": "false",
+            "use distant fog": "false",
+            "sky blending": "false",
+          },
+          Shadows: {
+            "enable shadows": "false",
+            "actor shadows": "false",
+            "player shadows": "false",
+            "object shadows": "false",
+            "terrain shadows": "false",
+          },
+          Cells: {
+            "preload enabled": "false",
+            "preload doors": "false",
+            "preload exterior grid": "false",
+            "preload fast travel": "false",
+            "preload cell cache min": "4",
+            "preload cell cache max": "8",
+          },
+          Game: { "actors processing range": "2560" },
+          Shaders: {
+            "max lights": "4",
+            "maximum light distance": "2048",
+            "force per pixel lighting": "false",
+            "antialias alpha test": "false",
+            "particle point lighting": "false",
+            "soft particles": "false",
+            "clamp lighting": "true",
+            "apply lighting to environment maps": "false",
+            "auto use object normal maps": "false",
+            "auto use object specular maps": "false",
+            "auto use terrain normal maps": "false",
+            "auto use terrain specular maps": "false",
+          },
+          General: { anisotropy: "0", "texture mipmap": "nearest" },
+          "Post Processing": { enabled: "false", chain: "" },
+          Video: { antialiasing: "0" },
+        };
+        function iniFromMap(map) {
+          var out = [];
+          Object.keys(map).forEach(function (sec) {
+            out.push("[" + sec + "]");
+            Object.keys(map[sec]).forEach(function (k) {
+              out.push(k + " = " + map[sec][k]);
+            });
+          });
+          return out.join("\n") + "\n";
+        }
+        // Set `map` values inside an existing settings.cfg text, keeping everything else the user saved.
+        function mergeIni(text, map) {
+          var lines = text ? text.split("\n") : [];
+          var secOf = [],
+            cur = "";
+          lines.forEach(function (l, i) {
+            var m = /^\s*\[([^\]]+)\]/.exec(l);
+            if (m) cur = m[1];
+            secOf[i] = cur;
+          });
+          Object.keys(map).forEach(function (sec) {
+            Object.keys(map[sec]).forEach(function (k) {
+              var val = map[sec][k],
+                found = false,
+                last = -1;
+              lines.forEach(function (l, i) {
+                if (secOf[i] !== sec) return;
+                last = i;
+                var m = /^\s*([^#;=\[][^=]*?)\s*=/.exec(l);
+                if (m && m[1].toLowerCase() === k.toLowerCase()) {
+                  lines[i] = k + " = " + val;
+                  found = true;
+                }
+              });
+              if (found) return;
+              if (last >= 0) {
+                lines.splice(last + 1, 0, k + " = " + val);
+                secOf.splice(last + 1, 0, sec);
+              } else {
+                lines.push("[" + sec + "]", k + " = " + val);
+                secOf.push(sec, sec);
+              }
+            });
+          });
+          return lines.join("\n") + "\n";
+        }
+        function forceUserSettings() {
+          var f = "/userdata/config/openmw/settings.cfg",
+            txt = "";
+          try {
+            if (FS.analyzePath(f).exists)
+              txt = FS.readFile(f, { encoding: "utf8" });
+          } catch (e) {}
+          FS.writeFile(f, mergeIni(txt, POTATO));
+          log("[quality] potato mode: forced low-end settings");
+        }
+
+        function settingsCfg() {
+          if (isPotato) {
+            var base = JSON.parse(JSON.stringify(POTATO));
+            base.Video = {
+              "resolution x": window.__renderW,
+              "resolution y": window.__renderH,
+              "window mode": 2,
+              gamma: 1.2,
+              antialiasing: 0,
+            };
+            return iniFromMap(base);
+          }
+          return [
+            "[Video]",
+            "resolution x = " + window.__renderW,
+            "resolution y = " + window.__renderH,
+            "window mode = 2",
+            "gamma = 1.2",
+            "[Camera]",
+            "viewing distance = " + TIER.vd + ".0",
+            "small feature culling pixel size = 3.0",
+            "[Terrain]",
+            "distant terrain = true",
+            "object paging = true",
+            "object paging active grid = true",
+            "object paging min size = " + TIER.minSize,
+            "object paging merge factor = 250",
+            "vertex lod mod = -1",
+            "lod factor = 1.0",
+            "[Water]",
+            "shader = true",
+            "reflection detail = 0",
+            "refraction = true",
+            "rtt size = " + TIER.rtt,
+            "rain ripple detail = 2",
+            "small feature culling pixel size = 30.0",
+            "[Fog]",
+            "radial fog = true",
+            "use distant fog = true",
+            "distant land fog start = 12288",
+            "distant land fog end = 16384",
+            "sky blending = true",
+            "sky blending start = 0.9",
+            "[Shadows]",
+            "enable shadows = true",
+            "shadow map resolution = " + TIER.shadowRes,
+            "number of shadow maps = 1",
+            "actor shadows = true",
+            "player shadows = true",
+            "object shadows = false",
+            "terrain shadows = true",
+            "maximum shadow map distance = " + TIER.shadowDist,
+            "[Cells]",
+            "preload cell cache max = 18",
+            // Preloading is synchronous on this build (the work queue runs inline), so speculative
+            // loads only add stalls to the frame that makes them.
+            "preload doors = false",
+            "preload exterior grid = false",
+            "[Game]",
+            "actors processing range = " + TIER.actors,
+            "[Shaders]",
+            "max lights = 16",
+            "maximum light distance = 8192",
+            "force per pixel lighting = true",
+            "antialias alpha test = true",
+            "minimum interior brightness = 0.25",
+            "particle point lighting = true",
+            "clamp lighting = false",
+            "match sunlight to sun = true",
+            "apply lighting to environment maps = true",
+            "auto use object normal maps = true",
+            "auto use object specular maps = true",
+            "auto use terrain normal maps = true",
+            "auto use terrain specular maps = true",
+            "soft particles = true",
+            "[General]",
+            "anisotropy = 16",
+            "texture mipmap = linear",
+            "[Post Processing]",
+            "enabled = true",
+            "chain = adjustments",
+            "",
+          ].join("\n");
+        }
+
+        window.Module = {
+          locateFile: function (path) {
+            return ENGINE_DIR + path;
+          },
+          canvas: canvas,
+          arguments: [],
+          preRun: [
+            function () {
+              try {
+                ENV.HOME = "/home/web_user";
+                ENV.USER = "player";
+                ENV.LOGNAME = "player";
+                ENV.OPENMW_DEBUG_LEVEL = "INFO";
+                ENV.ICU_DATA = "/";
+                // glGetError is a hard GPU sync in WebGL; checking it every frame is a stall.
+                ENV.OSG_GL_ERROR_CHECKING = "OFF";
+                // User config and data live on the persistent IDBFS mount.
+                ENV.XDG_CONFIG_HOME = "/userdata/config";
+                ENV.XDG_DATA_HOME = "/userdata/data-home";
+                ENV.XDG_CACHE_HOME = "/home/web_user/.cache";
+                FS.mkdirTree("/home/web_user/.cache/openmw");
+                // Baseline defaults only; the engine layers the persistent user settings.cfg on top.
+                FS.writeFile("/settings.cfg", settingsCfg());
+                FS.mkdirTree("/userdata");
+                try {
+                  if (navigator.storage && navigator.storage.persist)
+                    navigator.storage.persist();
+                } catch (e) {}
+
+                // Persist saves/config: IDBFS at /userdata, loaded before the engine starts.
+                var IDBFS = FS.filesystems.IDBFS;
+                if (IDBFS) {
+                  FS.mount(IDBFS, {}, "/userdata");
+                  addRunDependency("idbfs-load");
+                  FS.syncfs(true, function (err) {
+                    if (err) log("[idbfs] " + err);
+                    try {
+                      // Created after the mount+load: before it they would be hidden by the mount.
+                      FS.mkdirTree("/userdata/data");
+                      FS.mkdirTree("/userdata/config/openmw");
+                      FS.mkdirTree("/userdata/data-home/openmw");
+                      // Marks the user config dir as an active config path so settings are read/written there.
+                      if (
+                        !FS.analyzePath("/userdata/config/openmw/openmw.cfg")
+                          .exists
+                      )
+                        FS.writeFile(
+                          "/userdata/config/openmw/openmw.cfg",
+                          "# OpenMW user config dir\n",
+                        );
+                      if (isPotato) forceUserSettings();
+                      window.__omwSyncfs();
+                    } catch (e) {
+                      log("[idbfs setup] " + e);
+                    }
+                    removeRunDependency("idbfs-load");
+                  });
+                  setInterval(window.__omwSync, 15000);
+                }
+
+                mountDataFiles();
+              } catch (e) {
+                fatal("startup error: " + e);
+              }
+            },
+          ],
+          print: function (t) {
+            console.log(t);
+          },
+          printErr: function (t) {
+            console.warn(t);
+          },
+          onAbort: function (w) {
+            try {
+              window.__omwSync();
+            } catch (e) {}
+            fatal("engine aborted: " + w);
+          },
+          onRuntimeInitialized: function () {
+            // Quietly cache the game archives on disk while playing so later loads don't stall on the
+            // network. Opt out: localStorage.omw_nowarm = "1". Skipped on data saver or little free space.
+            setTimeout(function () {
+              try {
+                if (localStorage.getItem("omw_nowarm")) return;
+                var cn = navigator.connection;
+                if (cn && cn.saveData) return;
+                var go = function () {
+                  log("[warm] caching archives: " + StreamFS.warm() + " files");
+                };
+                if (navigator.storage && navigator.storage.estimate)
+                  navigator.storage.estimate().then(function (e) {
+                    if (e.quota && e.quota - (e.usage || 0) < 2147483648)
+                      log("[warm] skipped: under 2GB free storage");
+                    else go();
+                  });
+                else go();
+              } catch (e) {}
+            }, 20000);
+            // Drive frames from a MessageChannel: unlike setTimeout/rAF it is not throttled in a hidden
+            // tab. The hop is load-bearing -- running the frame synchronously inside rAF drains SDL's
+            // key-event queue before the browser has dispatched the pending keydown, and input dies.
+            try {
+              var mc = new MessageChannel(),
+                scheduled = false,
+                trapped = false;
+              function scheduleNext() {
+                if (scheduled) return;
+                scheduled = true;
+                if (document.hidden)
+                  setTimeout(function () {
+                    mc.port2.postMessage(0);
+                  }, 33);
+                else
+                  requestAnimationFrame(function () {
+                    mc.port2.postMessage(0);
+                  });
+              }
+              function pumpFrame() {
+                scheduled = false;
+                try {
+                  if (Module._omw_pump_frame) Module._omw_pump_frame();
+                } catch (e) {
+                  // A wasm trap unwinds past the engine's re-entrancy guard and freezes every later pump.
+                  if (!trapped) {
+                    trapped = true;
+                    fatal("engine crashed: " + ((e && e.message) || e));
+                  }
+                }
+                scheduleNext();
+              }
+              mc.port1.onmessage = pumpFrame;
+              document.addEventListener("visibilitychange", function () {
+                if (document.hidden && scheduled) mc.port2.postMessage(0);
+              });
+              mc.port2.postMessage(0);
+            } catch (e) {
+              fatal("frame pump failed: " + e);
+            }
+          },
+        };
+
+        // The Data Files folder sits next to this page.
+        var DATA = "Data%20Files/";
+
+        function mountDataFiles() {
+          FS.mkdirTree("/mwdata");
+          addRunDependency("mw-data");
+          var rootFiles = new Map(),
+            haveVideo = false;
+          fetch(DATA + "manifest.json")
+            .then(function (r) {
+              if (!r.ok)
+                throw new Error("no Data Files (HTTP " + r.status + ")");
+              return r.json();
+            })
+            .then(function (list) {
+              if (!list.length) throw new Error("Data Files is empty");
+              StreamFS.init();
+              list.forEach(function (f) {
+                var lower = f.p.toLowerCase();
+                if (lower.indexOf("/") < 0) rootFiles.set(lower, f.p);
+                if (/^video\/.*\.bik$/.test(lower)) haveVideo = true;
+                var dir = f.p.lastIndexOf("/");
+                if (dir > 0) {
+                  try {
+                    FS.mkdirTree("/mwdata/" + f.p.slice(0, dir));
+                  } catch (e) {}
+                }
+                // Retail files are immutable, so no mtime in the cache key.
+                StreamFS.mount(
+                  "/mwdata/" + f.p,
+                  DATA + f.p.split("/").map(encodeURIComponent).join("/"),
+                  f.s,
+                );
+              });
+              if (!rootFiles.has("morrowind.esm"))
+                throw new Error("Morrowind.esm not found in Data Files");
+              // The engine's preloaded openmw.cfg arrives with the .data package; rewrite it once present.
+              (function waitCfg() {
+                if (!FS.analyzePath("/openmw.cfg").exists)
+                  return setTimeout(waitCfg, 25);
+                var cfg = FS.readFile("/openmw.cfg", { encoding: "utf8" })
+                  .split("\n")
+                  .filter(function (l) {
+                    return (
+                      !/^content=/.test(l) &&
+                      !/^data=\/gamedata\s*$/.test(l) &&
+                      !/^fallback-archive=/.test(l) &&
+                      !/^fallback=Movies_/.test(l)
+                    );
+                  });
+                var lo = buildLoadOrder(rootFiles);
+                cfg.push("data=/mwdata", 'config="/userdata/config/openmw"');
+                lo.fbarch.forEach(function (a) {
+                  cfg.push("fallback-archive=" + a);
+                });
+                lo.content.forEach(function (c) {
+                  cfg.push("content=" + c);
+                });
+                if (haveVideo)
+                  cfg.push(
+                    "fallback=Movies_Company_Logo,bethesda logo.bik",
+                    "fallback=Movies_Morrowind_Logo,mw_logo.bik",
+                    "fallback=Movies_New_Game,mw_intro.bik",
+                  );
+                FS.writeFile("/openmw.cfg", cfg.join("\n"));
+                var t0 = performance.now();
+                Promise.race([
+                  StreamFS.whenReady(),
+                  new Promise(function (r) {
+                    setTimeout(function () {
+                      r("timeout");
+                    }, 10000);
+                  }),
+                ]).then(function (v) {
+                  log(
+                    v === "timeout"
+                      ? "[streamfs] worker did not start in 10s"
+                      : "[streamfs] worker ready in " +
+                          Math.round(performance.now() - t0) +
+                          "ms",
+                  );
+                  removeRunDependency("mw-data");
+                });
+              })();
+            })
+            .catch(function (e) {
+              fatal(String((e && e.message) || e));
+            });
+        }
+
+        window.__omwEngineSrc = ENGINE_DIR + "openmw.js";
+      })();
+    </script>
+    <script src="streamfs.js"></script>
+    <script>
+      if (!window.__omwFailed)
+        (function () {
+          // Workers can't be constructed from a cross-origin script URL (e.g. when this page is
+          // hosted on a CDN and embedded elsewhere), so hand emscripten a same-origin blob for its
+          // pthread workers.
+          function boot() {
+            var s = document.createElement("script");
+            s.src = window.__omwEngineSrc;
+            s.onerror = function () {
+              window.__omwFatal("could not load " + s.src);
+            };
+            document.body.appendChild(s);
+          }
+          fetch(window.__omwEngineSrc)
+            .then(function (r) {
+              if (!r.ok) throw new Error("HTTP " + r.status);
+              return r.blob();
+            })
+            .then(function (b) {
+              window.Module.mainScriptUrlOrBlob = new Blob([b], {
+                type: "text/javascript",
+              });
+            })
+            .catch(function (e) {
+              console.warn("engine blob fetch failed", e);
+            })
+            .then(boot);
+        })();
+    </script>
+  
+
+</body></html>
