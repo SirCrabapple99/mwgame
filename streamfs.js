@@ -125,7 +125,7 @@
         })();
         partCache.set(pk, whole);
         whole.catch(() => partCache.delete(pk));
-        while (partCache.size > 8) partCache.delete(partCache.keys().next().value);
+        while (partCache.size > 16) partCache.delete(partCache.keys().next().value);
         return whole;
       }
       async function rangeFetch(url, start, end) {
@@ -165,7 +165,7 @@
           // Content-Range and a truncated/garbled body for Range on these files.
           const whole = await getPart(url, idx);
           // Reading part N right after part N-1 is a sequential walk (an ESM): start N+1 now.
-          if (lastPart.get(url) === idx - 1) getPart(url, idx + 1).catch(() => {});
+          if (lastPart.get(url) === idx - 1) for (let k = 1; k <= 6; k++) getPart(url, idx + k).catch(() => {});
           lastPart.set(url, idx);
           const b = whole.subarray(pos - base, to - base);
           out.set(b, off);
