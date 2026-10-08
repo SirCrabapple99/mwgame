@@ -132,14 +132,15 @@
         stage(1, 0);
         console.log('[streamfs-worker] read', url, start, end, 'split=' + !!split.get(url));
         if (!split.has(url)) {
-          // Probe with a header-less HEAD: a cross-origin request carrying Range triggers a CORS
-          // preflight that CDNs like jsDelivr reject (no Access-Control-Allow-Headers: range), so the
-          // fetch would fail outright instead of returning the 404 that says "this file is split".
+          // A file is split iff its first part exists. Probing the parts (not "does the plain URL 404")
+          // matters: a CDN answers 403/404/other for an oversize original that is still in the repo
+          // beside its parts. HEAD without custom headers, so no CORS preflight (jsDelivr rejects
+          // Range in preflight).
           let h;
-          try { h = await fetch(url, { method: 'HEAD' }); } catch (e) { h = null; }
-          console.log('[streamfs-worker] HEAD', url, h && h.status);
+          try { h = await fetch(url + '.part000', { method: 'HEAD' }); } catch (e) { h = null; }
+          console.log('[streamfs-worker] HEAD part000', url, h && h.status);
           stage(2, h ? h.status : -1);
-          split.set(url, !!h && h.status === 404);
+          split.set(url, !!h && h.ok);
         }
         if (!split.get(url) && crossOrigin(url)) {
           // Same problem as the parts: a CDN's Range support can be wrong (jsDelivr measures against
