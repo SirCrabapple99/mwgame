@@ -197,22 +197,39 @@
           location.reload();
         });
 
+        // ---- low-end mode ------------------------------------------------------------------------
+        // "potato" turns everything optional off (no shadows, simple water, no distant terrain, small
+        // render target) for weak GPUs/CPUs such as a Celeron Chromebook. It is picked automatically
+        // on <=4 cores or <=4GB RAM, and can be forced either way from the console:
+        //   localStorage.omw_quality = "potato" | "low" | "mid" | "high"   (remove it for auto)
+        var devMem = navigator.deviceMemory || 0;
+        var cores = navigator.hardwareConcurrency || 0;
+        var qOverride = "";
+        try {
+          qOverride = localStorage.getItem("omw_quality") || "";
+        } catch (e) {}
+        var isPotato =
+          qOverride === "potato" ||
+          (!/^(low|mid|high)$/.test(qOverride) &&
+            ((cores > 0 && cores <= 4) || (devMem > 0 && devMem <= 4)));
+
         // ---- render size: drawing buffer at device pixels under a pixel budget -------------------
         var ss = 1;
         try {
           ss = parseFloat(localStorage.getItem("omw_ss")) || 1;
         } catch (e) {}
         ss = Math.max(1, Math.min(2, ss));
+        if (isPotato) ss = 1;
         function renderSize(factor) {
           var dpr = window.devicePixelRatio || 1;
           var cssW = window.innerWidth || 1280,
             cssH = window.innerHeight || 720;
           var w = cssW * dpr,
             h = cssH * dpr;
-          var base = Math.min(1, Math.sqrt(4000000 / (w * h)));
+          var base = Math.min(1, Math.sqrt((isPotato ? 800000 : 4000000) / (w * h)));
           var scale = base * factor;
-          if (w * h * scale * scale > 5500000)
-            scale = Math.sqrt(5500000 / (w * h));
+          var cap = isPotato ? 800000 : 5500000;
+          if (w * h * scale * scale > cap) scale = Math.sqrt(cap / (w * h));
           return {
             base: base,
             eff: scale / base,
@@ -258,7 +275,7 @@
         });
         // Called by the engine when the Options antialiasing setting changes.
         window.__omwSetSSAA = function (factor) {
-          factor = Math.max(1, Math.min(2, +factor || 1));
+          factor = isPotato ? 1 : Math.max(1, Math.min(2, +factor || 1));
           try {
             localStorage.setItem("omw_ss", String(factor));
           } catch (e) {}
@@ -408,9 +425,13 @@
         }
 
         // ---- quality tier, from device memory (coarse; absent on Firefox/Safari -> middle tier) ----
-        var devMem = navigator.deviceMemory || 0;
-        var tier =
-          devMem >= 8 ? "high" : devMem > 0 && devMem <= 4 ? "low" : "mid";
+        var tier = /^(low|mid|high)$/.test(qOverride)
+          ? qOverride
+          : devMem >= 8
+            ? "high"
+            : devMem > 0 && devMem <= 4
+              ? "low"
+              : "mid";
         var TIER = {
           low: {
             vd: "8192",
@@ -440,9 +461,137 @@
             lru: 192,
           },
         }[tier];
-        window.__omwLruDefault = TIER.lru; // read lazily by streamfs.js
+        window.__omwLruDefault = isPotato ? 32 : TIER.lru; // read lazily by streamfs.js
+
+        // Everything the engine would spend GPU/CPU on and a weak machine can live without. Applied as
+        // the baseline AND forced over the saved user settings (see forceUserSettings), so the in-game
+        // options (or older saved values) can't turn shadows etc. back on.
+        var POTATO = {
+          Camera: {
+            "viewing distance": "5120.0",
+            "small feature culling": "true",
+            "small feature culling pixel size": "16.0",
+          },
+          Terrain: {
+            "distant terrain": "false",
+            "object paging": "false",
+            "object paging active grid": "false",
+          },
+          Water: {
+            shader: "false",
+            refraction: "false",
+            "reflection detail": "0",
+            "rain ripple detail": "0",
+            "rtt size": "256",
+          },
+          Fog: {
+            "radial fog": "false",
+            "use distant fog": "false",
+            "sky blending": "false",
+          },
+          Shadows: {
+            "enable shadows": "false",
+            "actor shadows": "false",
+            "player shadows": "false",
+            "object shadows": "false",
+            "terrain shadows": "false",
+          },
+          Cells: {
+            "preload enabled": "false",
+            "preload doors": "false",
+            "preload exterior grid": "false",
+            "preload fast travel": "false",
+            "preload cell cache min": "4",
+            "preload cell cache max": "8",
+          },
+          Game: { "actors processing range": "2560" },
+          Shaders: {
+            "max lights": "4",
+            "maximum light distance": "2048",
+            "force per pixel lighting": "false",
+            "antialias alpha test": "false",
+            "particle point lighting": "false",
+            "soft particles": "false",
+            "clamp lighting": "true",
+            "apply lighting to environment maps": "false",
+            "auto use object normal maps": "false",
+            "auto use object specular maps": "false",
+            "auto use terrain normal maps": "false",
+            "auto use terrain specular maps": "false",
+          },
+          General: { anisotropy: "0", "texture mipmap": "nearest" },
+          "Post Processing": { enabled: "false", chain: "" },
+          Video: { antialiasing: "0" },
+        };
+        function iniFromMap(map) {
+          var out = [];
+          Object.keys(map).forEach(function (sec) {
+            out.push("[" + sec + "]");
+            Object.keys(map[sec]).forEach(function (k) {
+              out.push(k + " = " + map[sec][k]);
+            });
+          });
+          return out.join("\n") + "\n";
+        }
+        // Set `map` values inside an existing settings.cfg text, keeping everything else the user saved.
+        function mergeIni(text, map) {
+          var lines = text ? text.split("\n") : [];
+          var secOf = [],
+            cur = "";
+          lines.forEach(function (l, i) {
+            var m = /^\s*\[([^\]]+)\]/.exec(l);
+            if (m) cur = m[1];
+            secOf[i] = cur;
+          });
+          Object.keys(map).forEach(function (sec) {
+            Object.keys(map[sec]).forEach(function (k) {
+              var val = map[sec][k],
+                found = false,
+                last = -1;
+              lines.forEach(function (l, i) {
+                if (secOf[i] !== sec) return;
+                last = i;
+                var m = /^\s*([^#;=\[][^=]*?)\s*=/.exec(l);
+                if (m && m[1].toLowerCase() === k.toLowerCase()) {
+                  lines[i] = k + " = " + val;
+                  found = true;
+                }
+              });
+              if (found) return;
+              if (last >= 0) {
+                lines.splice(last + 1, 0, k + " = " + val);
+                secOf.splice(last + 1, 0, sec);
+              } else {
+                lines.push("[" + sec + "]", k + " = " + val);
+                secOf.push(sec, sec);
+              }
+            });
+          });
+          return lines.join("\n") + "\n";
+        }
+        function forceUserSettings() {
+          var f = "/userdata/config/openmw/settings.cfg",
+            txt = "";
+          try {
+            if (FS.analyzePath(f).exists)
+              txt = FS.readFile(f, { encoding: "utf8" });
+          } catch (e) {}
+          FS.writeFile(f, mergeIni(txt, POTATO));
+          log("[quality] potato mode: forced low-end settings");
+        }
 
         function settingsCfg() {
+          if (isPotato) {
+            var base = JSON.parse(JSON.stringify(POTATO));
+            base.Video = {
+              "resolution x": window.__renderW,
+              "resolution y": window.__renderH,
+              "window mode": 2,
+              gamma: 1.2,
+              antialiasing: 0,
+            };
+            return iniFromMap(base);
+          }
           return [
             "[Video]",
             "resolution x = " + window.__renderW,
@@ -566,6 +715,7 @@
                           "/userdata/config/openmw/openmw.cfg",
                           "# OpenMW user config dir\n",
                         );
+                      if (isPotato) forceUserSettings();
                       window.__omwSyncfs();
                     } catch (e) {
                       log("[idbfs setup] " + e);
