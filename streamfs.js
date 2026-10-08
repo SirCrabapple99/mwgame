@@ -78,6 +78,9 @@
     return `
       console.log('[streamfs-worker] started');
       let ctrl, data;
+      // Progress breadcrumbs in shared memory (worker console output is relayed via the main thread,
+      // which is blocked while a read is pending): [2]=stage [3]=detail [4]=last gen received.
+      const stage = (n, x) => { try { Atomics.store(ctrl, 2, n); Atomics.store(ctrl, 3, x | 0); } catch (e) {} };
       const handles = new Map();   // id -> FileSystemFileHandle
       const files = new Map();     // id -> File (cached getFile() result)
       let prefetch = null;         // {ckey, done}: the one outstanding sequential prefetch (backlog 389)
@@ -88,6 +91,7 @@
       const partCache = new Map(); // part url -> Promise<Uint8Array> (whole part, small LRU)
       async function rangeFetch(url, start, end) {
         const T0 = performance.now();
+        stage(1, 0);
         console.log('[streamfs-worker] read', url, start, end, 'split=' + !!split.get(url));
         if (!split.has(url)) {
           // Probe with a header-less HEAD: a cross-origin request carrying Range triggers a CORS
@@ -96,6 +100,7 @@
           let h;
           try { h = await fetch(url, { method: 'HEAD' }); } catch (e) { h = null; }
           console.log('[streamfs-worker] HEAD', url, h && h.status);
+          stage(2, h ? h.status : -1);
           split.set(url, !!h && h.status === 404);
         }
         if (!split.get(url)) {
@@ -115,9 +120,12 @@
           let whole = partCache.get(pk);
           if (!whole) {
             console.log('[streamfs-worker] downloading', pk);
+            stage(3, idx);
             whole = fetch(pk).then(async (r) => {
               if (!r.ok) throw new Error('HTTP ' + r.status);
+              stage(4, idx);
               const u = new Uint8Array(await r.arrayBuffer());
+              stage(5, idx);
               console.log('[streamfs-worker] got', pk, u.length, Math.round(performance.now() - T0) + 'ms');
               return u;
             });
@@ -134,6 +142,7 @@
       }
       onmessage = async (e) => {
         const m = e.data;
+        if (m.gen && ctrl) Atomics.store(ctrl, 4, m.gen);
         if (m.init) { ctrl = new Int32Array(m.ctrl); data = new Uint8Array(m.data); return; }
         if (m.mountLocal) { handles.set(m.mountLocal.id, m.mountLocal.handle); return; }
         // A Blob (BSA from the Cache API) reads exactly like a File (slice + arrayBuffer), so it
@@ -195,6 +204,7 @@
           }
         } catch (err) {
           console.error('[streamfs-worker] read failed', m.url, m.start, err && err.message || err);
+          stage(9, 0);
           ctrl[1] = -1;
           Atomics.store(ctrl, 0, m.gen);
           Atomics.notify(ctrl, 0);
@@ -232,7 +242,7 @@
     // eviction-thrashing working set shows up as misses climbing without bytes growing.
     const t0 = performance.now();
     while (Atomics.load(S.ctrl, 0) !== gen) {
-      if (performance.now() - t0 > 120000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start);
+      if (performance.now() - t0 > 25000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start + ' [worker stage=' + Atomics.load(S.ctrl, 2) + ' detail=' + Atomics.load(S.ctrl, 3) + ' lastGenSeen=' + Atomics.load(S.ctrl, 4) + ' wantGen=' + gen + ']');
     }
     ST.misses++; ST.stallMs += performance.now() - t0;
     if (ST.misses <= 5) console.log('[streamfs] worker answered', Math.round(performance.now() - t0) + 'ms', 'n=' + S.ctrl[1]);
@@ -302,7 +312,7 @@
       // also the JS-side memory ceiling: 384MB high / 192MB mid / 96MB low, on top of the wasm heap.
       if (!LRU_MAX) LRU_MAX = (typeof window !== 'undefined' && window.__omwLruDefault | 0) || 128;
       if (!self.crossOriginIsolated) throw new Error('streamfs needs crossOriginIsolated (COOP/COEP)');
-      const ctrlBuf = new SharedArrayBuffer(8);
+      const ctrlBuf = new SharedArrayBuffer(32);
       const dataBuf = new SharedArrayBuffer(CHUNK);
       S.ctrl = new Int32Array(ctrlBuf);
       S.data = new Uint8Array(dataBuf);
