@@ -86,9 +86,40 @@
       let prefetch = null;         // {ckey, done}: the one outstanding sequential prefetch (backlog 389)
       // Hosts that cap file size store big files as url.part000, url.part001, ... of PART bytes
       // each (the last shorter). If the plain URL 404s, read the range from the parts instead.
-      const PART = 15728640;
+      // Part size is detected per file from part000's real length (15MB for older splits, 2MB for newer).
+      const partSize = new Map();  // url -> bytes per part
       const split = new Map();     // url -> true when only the .partNNN pieces exist
       const partCache = new Map(); // part url -> Promise<Uint8Array> (whole part, small LRU)
+      const lastPart = new Map();  // url -> last part index read
+      // Whole parts are kept in a small in-memory LRU and persisted in the Cache API, keyed without
+      // the jsDelivr commit hash (retail data never changes), so a revisit or a new deploy re-uses them.
+      function getPart(url, idx) {
+        const pk = url + '.part' + String(idx).padStart(3, '0');
+        let whole = partCache.get(pk);
+        if (whole) { partCache.delete(pk); partCache.set(pk, whole); return whole; }
+        const ck = 'https://sfs.part/' + encodeURIComponent(pk.replace(/@[0-9a-f]{7,40}(?![0-9a-f])/, '@'));
+        whole = (async () => {
+          try {
+            const hit = await (await caches.open('mwdata-parts-v1')).match(ck);
+            if (hit) { stage(5, idx); return new Uint8Array(await hit.arrayBuffer()); }
+          } catch (e) { /* Cache API unavailable */ }
+          console.log('[streamfs-worker] downloading', pk);
+          stage(3, idx);
+          const T1 = performance.now();
+          const r = await fetch(pk);
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          stage(4, idx);
+          const u = new Uint8Array(await r.arrayBuffer());
+          stage(5, idx);
+          console.log('[streamfs-worker] got', pk, u.length, Math.round(performance.now() - T1) + 'ms');
+          caches.open('mwdata-parts-v1').then((c) => c.put(ck, new Response(u))).catch(() => {});
+          return u;
+        })();
+        partCache.set(pk, whole);
+        whole.catch(() => partCache.delete(pk));
+        while (partCache.size > 4) partCache.delete(partCache.keys().next().value);
+        return whole;
+      }
       async function rangeFetch(url, start, end) {
         const T0 = performance.now();
         stage(1, 0);
@@ -108,32 +139,20 @@
           if (r.ok || r.status === 206) return new Uint8Array(await r.arrayBuffer());
           throw new Error('HTTP ' + r.status);
         }
+        if (!partSize.has(url)) partSize.set(url, (await getPart(url, 0)).length);
+        const PART = partSize.get(url);
         const out = new Uint8Array(end - start);
         let off = 0;
         for (let pos = start; pos < end;) {
           const idx = Math.floor(pos / PART), base = idx * PART;
           const to = Math.min(end, base + PART);
           // Whole-part GET + local slice, not a Range request: some CDNs (jsDelivr) return a wrong
-          // Content-Range and a truncated/garbled body for Range on these files. Parts are cached
-          // (small LRU) so the many 2MB chunk reads inside one 15MB part cost a single download.
-          const pk = url + '.part' + String(idx).padStart(3, '0');
-          let whole = partCache.get(pk);
-          if (!whole) {
-            console.log('[streamfs-worker] downloading', pk);
-            stage(3, idx);
-            whole = fetch(pk).then(async (r) => {
-              if (!r.ok) throw new Error('HTTP ' + r.status);
-              stage(4, idx);
-              const u = new Uint8Array(await r.arrayBuffer());
-              stage(5, idx);
-              console.log('[streamfs-worker] got', pk, u.length, Math.round(performance.now() - T0) + 'ms');
-              return u;
-            });
-            partCache.set(pk, whole);
-            whole.catch(() => partCache.delete(pk));
-            while (partCache.size > 4) partCache.delete(partCache.keys().next().value);
-          } else { partCache.delete(pk); partCache.set(pk, whole); }
-          const b = (await whole).subarray(pos - base, to - base);
+          // Content-Range and a truncated/garbled body for Range on these files.
+          const whole = await getPart(url, idx);
+          // Reading part N right after part N-1 is a sequential walk (an ESM): start N+1 now.
+          if (lastPart.get(url) === idx - 1) getPart(url, idx + 1).catch(() => {});
+          lastPart.set(url, idx);
+          const b = whole.subarray(pos - base, to - base);
           out.set(b, off);
           off += b.length;
           pos = to;
