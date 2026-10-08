@@ -88,12 +88,19 @@
       async function rangeFetch(url, start, end) {
         const T0 = performance.now();
         console.log('[streamfs-worker] read', url, start, end, 'split=' + !!split.get(url));
+        if (!split.has(url)) {
+          // Probe with a header-less HEAD: a cross-origin request carrying Range triggers a CORS
+          // preflight that CDNs like jsDelivr reject (no Access-Control-Allow-Headers: range), so the
+          // fetch would fail outright instead of returning the 404 that says "this file is split".
+          let h;
+          try { h = await fetch(url, { method: 'HEAD' }); } catch (e) { h = null; }
+          console.log('[streamfs-worker] HEAD', url, h && h.status);
+          split.set(url, !!h && h.status === 404);
+        }
         if (!split.get(url)) {
           const r = await fetch(url, { headers: { Range: 'bytes=' + start + '-' + (end - 1) } });
-          console.log('[streamfs-worker] plain fetch ->', r.status, Math.round(performance.now() - T0) + 'ms');
           if (r.ok || r.status === 206) return new Uint8Array(await r.arrayBuffer());
-          if (r.status !== 404) throw new Error('HTTP ' + r.status);
-          split.set(url, true);
+          throw new Error('HTTP ' + r.status);
         }
         const out = new Uint8Array(end - start);
         let off = 0;
