@@ -202,10 +202,11 @@
         // render target) for weak GPUs/CPUs such as a Celeron Chromebook. It is picked automatically
         // on <=4 cores or <=4GB RAM, and can be forced either way from the console:
         //   localStorage.omw_quality = "potato" | "low" | "mid" | "high"   (remove it for auto)
-        // localStorage.omw_nosound = "1" turns off all audio and skips the Sound/Music/Video data.
-        var noSound = false;
+        // Audio is off by default: no-sound=1 in the engine config, and the Sound/Music/Video data is
+        // never mounted. localStorage.omw_nosound = "0" turns audio and movies back on.
+        var noSound = true;
         try {
-          noSound = localStorage.getItem("omw_nosound") === "1";
+          noSound = localStorage.getItem("omw_nosound") !== "0";
         } catch (e) {}
         var devMem = navigator.deviceMemory || 0;
         var cores = navigator.hardwareConcurrency || 0;
