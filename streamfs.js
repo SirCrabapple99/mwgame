@@ -100,7 +100,7 @@
       const lastPart = new Map();  // url -> last part index read
       // Whole parts are kept in a small in-memory LRU and persisted in the Cache API, keyed without
       // the jsDelivr commit hash (retail data never changes), so a revisit or a new deploy re-uses them.
-      const partKey = (pk) => 'https://sfs.part/' + encodeURIComponent(pk.replace(/@(?:[0-9a-f]{7,40}(?![0-9a-f])|latest|main)(?=\/)/, '@'));
+      const partKey = (pk) => 'https://sfs.part/' + encodeURIComponent(pk.replace(/@(?:[0-9a-f]{7,40}(?![0-9a-f])|latest|main)(?=\\/)/, '@'));
       function getPart(url, idx) {
         const pk = idx < 0 ? url : url + '.part' + String(idx).padStart(3, '0');   // idx<0: the unsplit file itself
         let whole = partCache.get(pk);
@@ -218,10 +218,15 @@
       }
       async function startPump() {
         if (pumping) return; pumping = true;
+        Atomics.store(ctrl, 12, 1);                       // pump started
         let seen = 0;
         for (;;) {
-          if (Atomics.waitAsync) { const r = Atomics.waitAsync(ctrl, 5, seen); if (r.async) await r.value; }
-          else await new Promise((res) => setTimeout(res, 1));
+          // Wake on notify, but never rely on it alone: the 8ms timeout re-checks the counter, so a
+          // missed wake-up costs at most ~8ms instead of a hang (the main thread is spinning, and we
+          // have seen cross-thread wake-ups not arrive in Chrome).
+          Atomics.add(ctrl, 11, 1);                       // heartbeat, shown in the timeout error
+          if (Atomics.waitAsync) { const r = Atomics.waitAsync(ctrl, 5, seen, 8); if (r.async) await r.value; }
+          else await new Promise((res) => setTimeout(res, 2));
           const g = Atomics.load(ctrl, 5);
           if (g === seen) continue;
           seen = g;
@@ -335,7 +340,7 @@
     // eviction-thrashing working set shows up as misses climbing without bytes growing.
     const t0 = performance.now();
     while (Atomics.load(S.ctrl, 0) !== gen) {
-      if (performance.now() - t0 > 60000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start + ' [worker stage=' + Atomics.load(S.ctrl, 2) + ' detail=' + Atomics.load(S.ctrl, 3) + ' lastGenSeen=' + Atomics.load(S.ctrl, 4) + ' wantGen=' + gen + ']');
+      if (performance.now() - t0 > 60000) throw new Error('streamfs: read timeout ' + cacheKey + '@' + start + ' [worker stage=' + Atomics.load(S.ctrl, 2) + ' detail=' + Atomics.load(S.ctrl, 3) + ' lastGenSeen=' + Atomics.load(S.ctrl, 4) + ' pumpStarted=' + Atomics.load(S.ctrl, 12) + ' heartbeat=' + Atomics.load(S.ctrl, 11) + ' wantGen=' + gen + ']');
     }
     ST.misses++; ST.stallMs += performance.now() - t0;
     if (ST.misses <= 5) console.log('[streamfs] worker answered', Math.round(performance.now() - t0) + 'ms', 'n=' + S.ctrl[1]);
