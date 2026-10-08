@@ -100,11 +100,12 @@
       const lastPart = new Map();  // url -> last part index read
       // Whole parts are kept in a small in-memory LRU and persisted in the Cache API, keyed without
       // the jsDelivr commit hash (retail data never changes), so a revisit or a new deploy re-uses them.
+      const partKey = (pk) => 'https://sfs.part/' + encodeURIComponent(pk.replace(/@[0-9a-f]{7,40}(?![0-9a-f])/, '@'));
       function getPart(url, idx) {
         const pk = idx < 0 ? url : url + '.part' + String(idx).padStart(3, '0');   // idx<0: the unsplit file itself
         let whole = partCache.get(pk);
         if (whole) { partCache.delete(pk); partCache.set(pk, whole); return whole; }
-        const ck = 'https://sfs.part/' + encodeURIComponent(pk.replace(/@[0-9a-f]{7,40}(?![0-9a-f])/, '@'));
+        const ck = partKey(pk);
         whole = (async () => {
           try {
             const hit = await (await caches.open('mwdata-parts-v1')).match(ck);
@@ -124,7 +125,7 @@
         })();
         partCache.set(pk, whole);
         whole.catch(() => partCache.delete(pk));
-        while (partCache.size > 4) partCache.delete(partCache.keys().next().value);
+        while (partCache.size > 8) partCache.delete(partCache.keys().next().value);
         return whole;
       }
       async function rangeFetch(url, start, end) {
@@ -182,6 +183,7 @@
         if (m.mountBlob) { files.set(m.mountBlob.id, m.mountBlob.blob); return; }
         if (m.regSrc) { srcs.set(m.regSrc.sid, m.regSrc); return; }
         if (m.sync) { postMessage({ synced: m.sync }); return; }
+        if (m.warm) { warmAll(m.warm); return; }
       };
       // Requests arrive through SHARED MEMORY, not postMessage: the engine's read blocks the main
       // thread, and Chrome does not reliably deliver main->worker messages while it is blocked (the
@@ -189,6 +191,31 @@
       // [6]=source id, [7]=start, [8]=end, [9]/[10]=prefetch next start/end ([9]<0: none).
       const srcs = new Map();      // source id -> {url, pkey} | {id}
       let pumping = false;
+      let busy = 0;                // engine reads in flight (the background warmer yields to them)
+      // BACKGROUND WARM: while the game runs and no read is pending, download every part of the given
+      // sources into the Cache API (one at a time), so later reads of those bytes are local instead of a
+      // network stall that blocks the frame. Already-cached parts are skipped, so it resumes across runs.
+      async function warmAll(sids) {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        for (const sid of sids) {
+          const src = srcs.get(sid);
+          if (!src || !src.url) continue;
+          try { const h = await fetch(src.url + '.part000', { method: 'HEAD' }); if (!h.ok) continue; } catch (e) { continue; }
+          for (let idx = 0; ; idx++) {
+            while (busy > 0) await sleep(150);
+            const pk = src.url + '.part' + String(idx).padStart(3, '0');
+            try {
+              const c = await caches.open('mwdata-parts-v1');
+              const ck = partKey(pk);
+              if (await c.match(ck)) continue;
+              const r = await fetch(pk);
+              if (!r.ok) break;
+              await c.put(ck, new Response(new Uint8Array(await r.arrayBuffer())));
+            } catch (e) { break; }
+          }
+          console.log('[streamfs-worker] warmed', src.url);
+        }
+      }
       async function startPump() {
         if (pumping) return; pumping = true;
         let seen = 0;
@@ -202,8 +229,9 @@
           const src = srcs.get(Atomics.load(ctrl, 6));
           if (!src) { stage(7, Atomics.load(ctrl, 6)); ctrl[1] = -1; Atomics.store(ctrl, 0, g); Atomics.notify(ctrl, 0); continue; }
           const ns = Atomics.load(ctrl, 9);
+          busy++;
           serve({ url: src.url, pkey: src.pkey, id: src.id, start: Atomics.load(ctrl, 7), end: Atomics.load(ctrl, 8),
-                  gen: g, next: ns >= 0 ? { start: ns, end: Atomics.load(ctrl, 10) } : null });
+                  gen: g, next: ns >= 0 ? { start: ns, end: Atomics.load(ctrl, 10) } : null }).finally(() => { busy--; });
         }
       }
       // m: {url|id, start, end, gen}
@@ -368,6 +396,13 @@
   window.StreamFS = {
     // Resolves once the worker is running AND has processed every earlier message (all mounts), so no
     // request can reach it before its source is registered.
+    // Start downloading all .bsa archives into the disk cache in the background.
+    warm() {
+      const sids = [];
+      S.urlSrcs.forEach((src, path) => { if (/\.bsa$/i.test(path) && src.sid) sids.push(src.sid); });
+      if (S.worker && sids.length) S.worker.postMessage({ warm: sids });
+      return sids.length;
+    },
     whenReady() {
       return (S.ready || Promise.resolve()).then(() => new Promise((res) => {
         if (!S.worker) return res();

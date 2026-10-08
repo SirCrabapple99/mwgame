@@ -461,7 +461,7 @@
             lru: 192,
           },
         }[tier];
-        window.__omwLruDefault = isPotato ? 32 : TIER.lru; // read lazily by streamfs.js
+        window.__omwLruDefault = isPotato ? 64 : TIER.lru; // read lazily by streamfs.js
 
         // Everything the engine would spend GPU/CPU on and a weak machine can live without. Applied as
         // the baseline AND forced over the saved user settings (see forceUserSettings), so the in-game
@@ -744,6 +744,25 @@
             fatal("engine aborted: " + w);
           },
           onRuntimeInitialized: function () {
+            // Quietly cache the game archives on disk while playing so later loads don't stall on the
+            // network. Opt out: localStorage.omw_nowarm = "1". Skipped on data saver or little free space.
+            setTimeout(function () {
+              try {
+                if (localStorage.getItem("omw_nowarm")) return;
+                var cn = navigator.connection;
+                if (cn && cn.saveData) return;
+                var go = function () {
+                  log("[warm] caching archives: " + StreamFS.warm() + " files");
+                };
+                if (navigator.storage && navigator.storage.estimate)
+                  navigator.storage.estimate().then(function (e) {
+                    if (e.quota && e.quota - (e.usage || 0) < 2147483648)
+                      log("[warm] skipped: under 2GB free storage");
+                    else go();
+                  });
+                else go();
+              } catch (e) {}
+            }, 20000);
             // Drive frames from a MessageChannel: unlike setTimeout/rAF it is not throttled in a hidden
             // tab. The hop is load-bearing -- running the frame synchronously inside rAF drains SDL's
             // key-event queue before the browser has dispatched the pending keydown, and input dies.
