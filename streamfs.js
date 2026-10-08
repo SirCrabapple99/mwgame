@@ -95,11 +95,13 @@
       const partSize = new Map();  // url -> bytes per part
       const split = new Map();     // url -> true when only the .partNNN pieces exist
       const partCache = new Map(); // part url -> Promise<Uint8Array> (whole part, small LRU)
+      let selfOrigin = ''; try { selfOrigin = new URL(self.location.href).origin; } catch (e) {}
+      const crossOrigin = (u) => { try { return new URL(u).origin !== selfOrigin; } catch (e) { return false; } };
       const lastPart = new Map();  // url -> last part index read
       // Whole parts are kept in a small in-memory LRU and persisted in the Cache API, keyed without
       // the jsDelivr commit hash (retail data never changes), so a revisit or a new deploy re-uses them.
       function getPart(url, idx) {
-        const pk = url + '.part' + String(idx).padStart(3, '0');
+        const pk = idx < 0 ? url : url + '.part' + String(idx).padStart(3, '0');   // idx<0: the unsplit file itself
         let whole = partCache.get(pk);
         if (whole) { partCache.delete(pk); partCache.set(pk, whole); return whole; }
         const ck = 'https://sfs.part/' + encodeURIComponent(pk.replace(/@[0-9a-f]{7,40}(?![0-9a-f])/, '@'));
@@ -138,6 +140,12 @@
           console.log('[streamfs-worker] HEAD', url, h && h.status);
           stage(2, h ? h.status : -1);
           split.set(url, !!h && h.status === 404);
+        }
+        if (!split.get(url) && crossOrigin(url)) {
+          // Same problem as the parts: a CDN's Range support can be wrong (jsDelivr measures against
+          // the compressed size, giving 416s and short bodies). Unsplit files are under the host's
+          // size cap, so fetch the file whole once, cache it, and slice locally.
+          return (await getPart(url, -1)).slice(start, end);
         }
         if (!split.get(url)) {
           const r = await fetch(url, { headers: { Range: 'bytes=' + start + '-' + (end - 1) } });
