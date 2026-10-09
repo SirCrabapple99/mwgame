@@ -937,6 +937,26 @@
             })
             .then(boot);
         })();
+
+        frame.addEventListener("load", () => {
+  const doc = frame.contentDocument;
+  if (!doc) return;
+
+  doc.addEventListener("keydown", (e) => {
+    if (e.code !== "Backquote" || e.repeat) return;
+    e.preventDefault();
+    doc.dispatchEvent(new KeyboardEvent("keydown", {
+      key: "Escape", code: "Escape", keyCode: 27, bubbles: true, cancelable: true,
+    }));
+  });
+
+  doc.addEventListener("keyup", (e) => {
+    if (e.code !== "Backquote") return;
+    doc.dispatchEvent(new KeyboardEvent("keyup", {
+      key: "Escape", code: "Escape", keyCode: 27, bubbles: true, cancelable: true,
+    }));
+  });
+});
     </script>
   
 
