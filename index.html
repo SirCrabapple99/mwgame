@@ -204,9 +204,16 @@
         //   localStorage.omw_quality = "potato" | "low" | "mid" | "high"   (remove it for auto)
         // Audio is off by default: no-sound=1 in the engine config, and the Sound/Music/Video data is
         // never mounted. localStorage.omw_nosound = "0" turns audio and movies back on.
+        // URL flags work without devtools. The sn-games player runs this page in a blob frame with no query
+        // of its own, so they are read from the embedding page too: ?stats ?nowarm ?sound ?quality=potato
+        var qs = location.search;
+        try {
+          if (window.parent !== window) qs += parent.location.search;
+        } catch (e) {}
         var noSound = true;
         try {
-          noSound = localStorage.getItem("omw_nosound") !== "0";
+          noSound =
+            localStorage.getItem("omw_nosound") !== "0" && !/[?&]sound\b/.test(qs);
         } catch (e) {}
         var devMem = navigator.deviceMemory || 0;
         var cores = navigator.hardwareConcurrency || 0;
@@ -214,6 +221,8 @@
         try {
           qOverride = localStorage.getItem("omw_quality") || "";
         } catch (e) {}
+        var qm = /[?&]quality=(low|mid|high|potato)\b/.exec(qs);
+        if (qm) qOverride = qm[1];
         var isPotato =
           qOverride === "potato" ||
           (!/^(low|mid|high)$/.test(qOverride) &&
@@ -754,7 +763,7 @@
             // network. Opt out: localStorage.omw_nowarm = "1". Skipped on data saver or little free space.
             setTimeout(function () {
               try {
-                if (localStorage.getItem("omw_nowarm")) return;
+                if (localStorage.getItem("omw_nowarm") || /[?&]nowarm\b/.test(qs)) return;
                 var cn = navigator.connection;
                 if (cn && cn.saveData) return;
                 var go = function () {
@@ -908,6 +917,42 @@
       })();
     </script>
     <script src="streamfs.js"></script>
+    <script>
+      // ?stats: on-screen readout of main-thread stalls. fps is the browser's frame rate (requestAnimationFrame),
+      // which drops when the main thread is blocked; stall ms/s is time spent waiting on streamed reads.
+      (function () {
+        var qs = location.search;
+        try {
+          if (window.parent !== window) qs += parent.location.search;
+        } catch (e) {}
+        if (!/[?&]stats\b/.test(qs) || !window.StreamFS) return;
+        var d = document.createElement("pre");
+        d.style.cssText =
+          "position:fixed;top:0;left:0;z-index:99999;margin:0;padding:4px;background:#000c;color:#0f0;font:12px monospace;pointer-events:none";
+        document.body.appendChild(d);
+        var last = StreamFS.stats(),
+          f = 0,
+          t = performance.now();
+        (function r() {
+          f++;
+          requestAnimationFrame(r);
+        })();
+        setInterval(function () {
+          var s = StreamFS.stats(),
+            n = performance.now(),
+            k = (n - t) / 1000;
+          d.textContent =
+            "fps " + Math.round(f / k) +
+            "\nmiss/s " + ((s.misses - last.misses) / k).toFixed(1) +
+            "\nstall ms/s " + Math.round((s.stallMs - last.stallMs) / k) +
+            "\nevict " + (s.evictions - last.evictions) +
+            "\ncached " + s.cached + "/" + s.lruMax;
+          last = s;
+          f = 0;
+          t = n;
+        }, 1000);
+      })();
+    </script>
     <script>
       if (!window.__omwFailed)
         (function () {
